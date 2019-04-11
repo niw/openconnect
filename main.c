@@ -2517,7 +2517,7 @@ static int process_auth_form_cb(void *_vpninfo,
 				opt->_value = password;
 				password = NULL;
 #if ENABLE_KEYCHAIN
-      } else if (keychain_account) {
+			} else if (keychain_account) {
 				opt->_value = lookup_keychain_password(keychain_account, opt, vpninfo);
 #endif
 			} else {
