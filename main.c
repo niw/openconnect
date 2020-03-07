@@ -2392,7 +2392,7 @@ static char *lookup_keychain_password(const char *acc,
 
 			label = CFStringCreateWithFormat(kCFAllocatorDefault, NULL, CFSTR("openconnect: %@ (%@)"), account, name);
 			if (!label) goto end;
-			data = CFDataCreate(kCFAllocatorDefault, (UInt8 *)result, len + 1);
+			data = CFDataCreate(kCFAllocatorDefault, (UInt8 *)result, len);
 			if (!data) goto end;
 
 			CFDictionaryAddValue(query, kSecAttrLabel, label);
@@ -2418,10 +2418,11 @@ static char *lookup_keychain_password(const char *acc,
 	if (!data || CFGetTypeID(data) != CFDataGetTypeID()) goto end;
 
 	CFIndex size = CFDataGetLength(data);
-	result = malloc((size_t)size);
+	result = malloc((size_t)size + 1);
 	if (!result) goto end;
 
 	CFDataGetBytes(data, CFRangeMake(0, size), (UInt8 *)result);
+	result[size] = 0x00;
 
 end:
 	if (query) CFRelease(query);
