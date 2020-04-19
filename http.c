@@ -907,6 +907,7 @@ void dump_buf(struct openconnect_info *vpninfo, char prefix, char *buf)
 
 void dump_buf_hex(struct openconnect_info *vpninfo, int loglevel, char prefix, unsigned char *buf, int len)
 {
+#if 0
 	struct oc_text_buf *line = buf_alloc();
 	int i, j;
 
@@ -931,6 +932,7 @@ void dump_buf_hex(struct openconnect_info *vpninfo, int loglevel, char prefix, u
 		vpn_progress(vpninfo, loglevel, "%c %s\n", prefix, line->data);
 	}
 	buf_free(line);
+#endif
 }
 
 static int https_socket_closed(struct openconnect_info *vpninfo)
