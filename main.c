@@ -62,6 +62,11 @@
 static const char *legacy_charset;
 #endif
 
+#if ENABLE_KEYCHAIN
+#include <CoreFoundation/CoreFoundation.h>
+#include <Security/Security.h>
+#endif
+
 static int write_new_config(void *_vpninfo,
 			    const char *buf, int buflen);
 static void __attribute__ ((format(printf, 3, 4)))
@@ -85,6 +90,8 @@ static int do_passphrase_from_fsid;
 static int non_inter;
 static int cookieonly;
 static int allow_stdin_read;
+static char *keychain_account = NULL;
+static struct oc_text_list_item *keychain_saving_fields = NULL;
 
 static char *token_filename;
 static char *server_cert = NULL;
@@ -176,6 +183,8 @@ enum {
 	OPT_NO_XMLPOST,
 	OPT_PIDFILE,
 	OPT_PASSWORD_ON_STDIN,
+	OPT_USE_KEYCHAIN,
+	OPT_SAVE_TO_KEYCHAIN,
 	OPT_PRINTCOOKIE,
 	OPT_RECONNECT_TIMEOUT,
 	OPT_SERVERCERT,
@@ -251,6 +260,10 @@ static const struct option long_options[] = {
 	OPTION("xmlconfig", 1, 'x'),
 	OPTION("cookie-on-stdin", 0, OPT_COOKIE_ON_STDIN),
 	OPTION("passwd-on-stdin", 0, OPT_PASSWORD_ON_STDIN),
+#if ENABLE_KEYCHAIN
+	OPTION("use-keychain", 1, OPT_USE_KEYCHAIN),
+	OPTION("save-to-keychain", 1, OPT_SAVE_TO_KEYCHAIN),
+#endif
 	OPTION("no-passwd", 0, OPT_NO_PASSWD),
 	OPTION("reconnect-timeout", 1, OPT_RECONNECT_TIMEOUT),
 	OPTION("dtls-ciphers", 1, OPT_DTLS_CIPHERS),
@@ -815,6 +828,10 @@ static void usage(void)
 	printf("      --no-passwd                 %s\n", _("Disable password/SecurID authentication"));
 	printf("      --non-inter                 %s\n", _("Do not expect user input; exit if it is required"));
 	printf("      --passwd-on-stdin           %s\n", _("Read password from standard input"));
+#if ENABLE_KEYCHAIN
+	printf("      --use-keychain=ACCOUNT      %s\n", _("Look up Keychain to fill password form fields"));
+	printf("      --save-to-keychain=NAME     %s\n", _("Name of password form field to be saved to Keychain"));
+#endif
 	printf("      --authgroup=GROUP           %s\n", _("Choose authentication login selection"));
 	printf("  -F, --form-entry=FORM:OPT=VALUE %s\n", _("Provide authentication form responses"));
 	printf("  -c, --certificate=CERT          %s\n", _("Use SSL client certificate CERT"));
@@ -1581,6 +1598,18 @@ int main(int argc, char **argv)
 			read_stdin(&password, 0, 0);
 			allow_stdin_read = 1;
 			break;
+#if ENABLE_KEYCHAIN
+		case OPT_USE_KEYCHAIN:
+			keychain_account = keep_config_arg();
+			break;
+		case OPT_SAVE_TO_KEYCHAIN: {
+			struct oc_text_list_item *field = malloc(sizeof(*field));
+			field->data = keep_config_arg();
+			field->next = keychain_saving_fields;
+			keychain_saving_fields = field;
+			break;
+		}
+#endif
 		case OPT_NO_PASSWD:
 			vpninfo->nopasswd = 1;
 			break;
@@ -2314,6 +2343,99 @@ static char *saved_form_field(struct openconnect_info *vpninfo, const char *form
 	return NULL;
 }
 
+#if ENABLE_KEYCHAIN
+static char *lookup_keychain_password(const char *acc,
+				struct oc_form_opt *opt,
+				struct openconnect_info *vpninfo)
+{
+	OSStatus err = 0;
+
+	CFMutableDictionaryRef query = NULL;
+	CFStringRef account = NULL, name = NULL, key = NULL, label = NULL;
+	CFTypeRef data = NULL;
+	char *result = NULL;
+
+	if (verbose > PRG_INFO)
+		fprintf(stderr, "Lookup keychain for account: %s name: %s\n", acc, opt->name);
+
+	query = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	if (!query) goto end;
+
+	account = CFStringCreateWithCString(kCFAllocatorDefault, acc, kCFStringEncodingUTF8);
+	if (!account) goto end;
+	name = CFStringCreateWithCString(kCFAllocatorDefault, opt->name, kCFStringEncodingUTF8);
+	if (!name) goto end;
+	key = CFStringCreateWithFormat(kCFAllocatorDefault, NULL, CFSTR("%@:%@"), account, name);
+	if (!key) goto end;
+
+	CFDictionaryAddValue(query, kSecClass, kSecClassGenericPassword);
+	CFDictionaryAddValue(query, kSecAttrService, CFSTR("openconnect"));
+	CFDictionaryAddValue(query, kSecAttrAccount, key);
+	CFDictionaryAddValue(query, kSecMatchLimit, kSecMatchLimitOne);
+	CFDictionaryAddValue(query, kSecReturnData, kCFBooleanTrue);
+
+	err = SecItemCopyMatching(query, &data);
+	if (err == errSecItemNotFound) {
+		if (data) CFRelease(data);
+
+		if (verbose > PRG_ERR)
+			fprintf(stderr, "Item not found in Keychain\n");
+
+		result = prompt_for_input(opt->label, vpninfo, 1);
+		if (!result) goto end;
+		size_t len = strlen(result);
+		if (len == 0) goto end;
+
+		for (struct oc_text_list_item *field = keychain_saving_fields; field; field = field->next) {
+			if (strcmp(opt->name, field->data))
+				continue;
+
+			label = CFStringCreateWithFormat(kCFAllocatorDefault, NULL, CFSTR("openconnect: %@ (%@)"), account, name);
+			if (!label) goto end;
+			data = CFDataCreate(kCFAllocatorDefault, (UInt8 *)result, len);
+			if (!data) goto end;
+
+			CFDictionaryAddValue(query, kSecAttrLabel, label);
+			CFDictionaryAddValue(query, kSecValueData, data);
+			CFDictionaryRemoveValue(query, kSecReturnData);
+
+			err = SecItemAdd(query, NULL);
+			if (err != errSecSuccess) {
+				if (verbose > PRG_ERR)
+					fprintf(stderr, "Failed to add item to Keychain error: %d\n", err);
+			} else {
+				if (verbose > PRG_INFO)
+					fprintf(stderr, "Item saved in Keychain\n");
+			}
+			goto end;
+		}
+		goto end;
+	} else if (err != errSecSuccess) {
+		if (verbose > PRG_ERR)
+			fprintf(stderr, "Failed to find item in Keychain error: %d\n", err);
+		goto end;
+	}
+	if (!data || CFGetTypeID(data) != CFDataGetTypeID()) goto end;
+
+	CFIndex size = CFDataGetLength(data);
+	result = malloc((size_t)size + 1);
+	if (!result) goto end;
+
+	CFDataGetBytes(data, CFRangeMake(0, size), (UInt8 *)result);
+	result[size] = 0x00;
+
+end:
+	if (query) CFRelease(query);
+	if (account) CFRelease(account);
+	if (name) CFRelease(name);
+	if (key) CFRelease(key);
+	if (label) CFRelease(label);
+	if (data) CFRelease(data);
+
+	return result;
+}
+#endif
+
 /* Return value:
  *  < 0, on error
  *  = 0, when form was parsed and POST required
@@ -2395,6 +2517,10 @@ static int process_auth_form_cb(void *_vpninfo,
 			if (password) {
 				opt->_value = password;
 				password = NULL;
+#if ENABLE_KEYCHAIN
+			} else if (keychain_account) {
+				opt->_value = lookup_keychain_password(keychain_account, opt, vpninfo);
+#endif
 			} else {
 				opt->_value = saved_form_field(vpninfo, form->auth_id, opt->name);
 				if (!opt->_value)
